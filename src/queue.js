@@ -39,6 +39,8 @@ class Queue {
         const jobId = crypto.randomUUID();
         const priority = options.priority || 'default';
         const delay = options.delay || 0;
+        const maxAttempts = options.maxAttempts || 1;
+        const backoff = options.backoff || 1000; // Base backoff in ms
         
         const jobKey = `job:${jobId}`;
         const createdAt = Date.now();
@@ -52,7 +54,10 @@ class Queue {
             'data', JSON.stringify(data),
             'priority', priority,
             'createdAt', createdAt,
-            'status', delay > 0 ? 'delayed' : 'waiting'
+            'status', delay > 0 ? 'delayed' : 'waiting',
+            'attemptsMade', 0,
+            'maxAttempts', maxAttempts,
+            'backoff', backoff
         );
         
         // 2. Add to appropriate queue
