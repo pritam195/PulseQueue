@@ -5,9 +5,12 @@ const mongoose = require('mongoose');
 const JobRecord = require('./models/JobRecord');
 
 class Worker {
-    constructor(queueName, processFn, redisOptions = {}) {
+    constructor(queueName, processFn, options = {}) {
         this.queueName = queueName;
         this.processFn = processFn;
+        this.concurrency = options.concurrency || 1;
+        
+        const redisOptions = options.redis || {};
         this.redis = new Redis(redisOptions);
         this.blockingRedis = new Redis(redisOptions);
         
@@ -23,6 +26,7 @@ class Worker {
         };
         
         this.stopped = false;
+        this.activeJobs = new Set();
         
         const scriptPath = path.join(__dirname, 'lua', 'dequeuePriority.lua');
         const dequeueScript = fs.readFileSync(scriptPath, 'utf8');
@@ -35,16 +39,37 @@ class Worker {
     
     async start() {
         this.stopped = false;
-        this.loop();
+        
+        // Spawn N concurrent loops
+        for (let i = 0; i < this.concurrency; i++) {
+            this.loop(i);
+        }
     }
     
-    async stop() {
+    async stop(timeoutMs = 25000) {
         this.stopped = true;
-        await this.redis.quit();
-        await this.blockingRedis.quit();
+        
+        // Disconnecting blockingRedis instantly aborts any pending BRPOP
+        await this.blockingRedis.quit().catch(() => {});
+        
+        if (this.activeJobs.size > 0) {
+            console.log(`[Worker] Shutting down. Waiting for ${this.activeJobs.size} active jobs to finish...`);
+            
+            // Wait for jobs to finish OR timeout
+            const timeoutPromise = new Promise(resolve => setTimeout(resolve, timeoutMs));
+            const jobsPromise = Promise.allSettled(Array.from(this.activeJobs));
+            
+            await Promise.race([jobsPromise, timeoutPromise]);
+            
+            if (this.activeJobs.size > 0) {
+                console.warn(`[Worker] Shutdown timeout reached. Abandoning ${this.activeJobs.size} jobs to the Reaper.`);
+            }
+        }
+        
+        await this.redis.quit().catch(() => {});
     }
     
-    async loop() {
+    async loop(workerId) {
         while (!this.stopped) {
             try {
                 const jobId = await this.redis.dequeuePriority(
@@ -55,7 +80,14 @@ class Worker {
                 );
                 
                 if (jobId) {
-                    await this.executeJobWithHeartbeat(jobId);
+                    const jobPromise = this.executeJobWithHeartbeat(jobId);
+                    this.activeJobs.add(jobPromise);
+                    
+                    try {
+                        await jobPromise;
+                    } finally {
+                        this.activeJobs.delete(jobPromise);
+                    }
                 } else {
                     if (!this.stopped) {
                         await this.blockingRedis.brpop(this.keys.notify, 2);
@@ -63,7 +95,7 @@ class Worker {
                 }
             } catch (err) {
                 if (this.stopped && err.message.includes("Connection is closed")) break;
-                console.error("Worker loop error:", err);
+                console.error(`[Worker-${workerId}] loop error:`, err);
                 await new Promise(resolve => setTimeout(resolve, 1000));
             }
         }
@@ -74,23 +106,19 @@ class Worker {
         let heartbeatInterval;
         
         try {
-            // 1. Acquire Lease (30 seconds)
             await this.redis.set(lockKey, 'locked', 'EX', 30);
             
-            // 2. Start Heartbeat (Renew every 15 seconds)
             heartbeatInterval = setInterval(async () => {
                 try {
                     await this.redis.expire(lockKey, 30);
                 } catch (e) {
-                    console.error(`Failed to renew lock for job ${jobId}`, e);
+                    // Ignore expire errors on shutdown
                 }
             }, 15000);
 
-            // 3. Execute
             await this.executeJob(jobId);
 
         } finally {
-            // 4. Clean up lock and interval regardless of success/failure
             if (heartbeatInterval) clearInterval(heartbeatInterval);
             await this.redis.del(lockKey).catch(() => {});
         }
@@ -101,7 +129,6 @@ class Worker {
         const rawHash = await this.redis.hgetall(jobKey);
         
         if (!rawHash || !rawHash.id) {
-            // Job data is missing, just remove from processing
             await this.redis.lrem(this.keys.processing, 1, jobId);
             return;
         }
@@ -128,7 +155,6 @@ class Worker {
         pipeline.hset(jobKey, 'status', 'completed');
         await pipeline.exec();
 
-        // Optional: Save to MongoDB for audit history
         try {
             if (mongoose.connection.readyState === 1) {
                 await JobRecord.create({
@@ -140,7 +166,6 @@ class Worker {
                     attemptsMade: parseInt(rawHash.attemptsMade) || 1,
                     maxAttempts: parseInt(rawHash.maxAttempts) || 1
                 });
-                // Remove from Redis if stored durably
                 await this.redis.del(jobKey);
             }
         } catch (dbErr) {
@@ -149,15 +174,13 @@ class Worker {
     }
 
     async handleFailure(jobId, rawHash, err) {
-        console.error(`Job ${jobId} failed:`, err.message);
         const jobKey = `job:${jobId}`;
         let attemptsMade = (parseInt(rawHash.attemptsMade) || 0) + 1;
         const maxAttempts = parseInt(rawHash.maxAttempts) || 1;
         const baseBackoff = parseInt(rawHash.backoff) || 1000;
 
         if (attemptsMade < maxAttempts) {
-            // Retry: Exponential Backoff + Jitter
-            const jitter = Math.floor(Math.random() * 500); // 0-500ms jitter
+            const jitter = Math.floor(Math.random() * 500);
             const delay = (baseBackoff * Math.pow(2, attemptsMade - 1)) + jitter;
             const runAt = Date.now() + delay;
 
@@ -166,11 +189,7 @@ class Worker {
             pipeline.zadd(this.keys.delayed, runAt, jobId);
             pipeline.lrem(this.keys.processing, 1, jobId);
             await pipeline.exec();
-            
-            console.log(`Job ${jobId} scheduled for retry ${attemptsMade}/${maxAttempts} in ${delay}ms`);
         } else {
-            // Dead Letter Queue
-            console.log(`Job ${jobId} exhausted all ${maxAttempts} attempts. Moving to DLQ.`);
             const pipeline = this.redis.pipeline();
             pipeline.lrem(this.keys.processing, 1, jobId);
             pipeline.hset(jobKey, 'status', 'failed', 'failedReason', err.message, 'attemptsMade', attemptsMade);
@@ -188,7 +207,6 @@ class Worker {
                         maxAttempts,
                         failedReason: err.message
                     });
-                    // Clean up Redis as it's now safely in MongoDB
                     await this.redis.del(jobKey);
                 }
             } catch (dbErr) {
