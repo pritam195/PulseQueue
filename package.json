@@ -4,18 +4,24 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "jest",
+    "server": "node server.js",
+    "dashboard": "cd dashboard && npm run dev",
+    "dev": "concurrently \"npm run server\" \"npm run dashboard\""
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
     "ioredis": "^6.0.0",
     "mongoose": "^9.9.3",
     "uuid": "^14.0.2"
   },
   "devDependencies": {
+    "concurrently": "^10.0.5",
     "jest": "^30.4.2",
     "mongodb-memory-server": "^11.2.0"
   }
