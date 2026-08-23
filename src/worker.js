@@ -8,6 +8,7 @@ class Worker {
     constructor(queueName, processFn, options = {}) {
         this.queueName = queueName;
         this.processFn = processFn;
+        this.options = options;
         this.concurrency = options.concurrency || 1;
         
         const redisOptions = options.redis || {};
@@ -105,12 +106,14 @@ class Worker {
         const lockKey = `job:${jobId}:lock`;
         let heartbeatInterval;
         
+        const lockTTL = this.options.lockTTL || 30;
+        
         try {
-            await this.redis.set(lockKey, 'locked', 'EX', 30);
+            await this.redis.set(lockKey, 'locked', 'EX', lockTTL);
             
             heartbeatInterval = setInterval(async () => {
                 try {
-                    await this.redis.expire(lockKey, 30);
+                    await this.redis.expire(lockKey, lockTTL);
                 } catch (e) {
                     // Ignore expire errors on shutdown
                 }

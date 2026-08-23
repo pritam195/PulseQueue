@@ -1,0 +1,14 @@
+{
+  "config": {
+    "workers": 20,
+    "jobs": 5000
+  },
+  "idle_cpu_percent": "155.62",
+  "throughput_jobs_per_sec": 966,
+  "total_wall_time_ms": 5175,
+  "latency_ms": {
+    "p50": 2084,
+    "p95": 3584,
+    "p99": 4006
+  }
+}
